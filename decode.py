@@ -1,19 +1,22 @@
 import struct
 
+import numpy as np
+
 # https://www.w3.org/Graphics/JPEG/itu-t81.pdf
 
-EMPTY = bytes()
-
 # itu-t81 p.36
-byte_to_marker = {
+MARKER_PREFIX = 0xFF
+STANDALONE_MARKERS = tuple(f"RST{i}" for i in range(8)) + ("SOI", "EOI", "TEM")
+
+BYTE_TO_MARKER = {
     0x01: "TEM",    # temporary private use in arithmetic coding
     0xFE: "COM",    # comment
 }
 
 for i in range(16):
-    byte_to_marker[0xC0 + i] = f"SOF{i}"    # start of frame
+    BYTE_TO_MARKER[0xC0 + i] = f"SOF{i}"    # start of frame
 
-byte_to_marker.update({
+BYTE_TO_MARKER.update({
     0xC4: "DHT",    # define Huffman table
     0xC8: "JPG",    # reserved
     0xCC: "DAC",    # define arithmetic coding conditioning(s)
@@ -21,9 +24,9 @@ byte_to_marker.update({
 
 # restart interval termination
 for i in range(8):
-    byte_to_marker[0xD0 + i] = f"RST{i}"
+    BYTE_TO_MARKER[0xD0 + i] = f"RST{i}"
 
-byte_to_marker.update({
+BYTE_TO_MARKER.update({
     0xD8: "SOI",    # start of image
     0xD9: "EOI",    # end of image
     0xDA: "SOS",    # start of scan
@@ -35,13 +38,10 @@ byte_to_marker.update({
 })
 
 for i in range(16):
-    byte_to_marker[0xE0 + i] = f"APP{i}"    # app segments
+    BYTE_TO_MARKER[0xE0 + i] = f"APP{i}"    # app segments
 
 for i in range(14):
-    byte_to_marker[0xF0 + i] = f"JPG{i}"    # reserved
-
-
-SKIP = bytes([0x00])
+    BYTE_TO_MARKER[0xF0 + i] = f"JPG{i}"    # reserved
 
 
 def decode_zigzag(x):
@@ -62,36 +62,41 @@ def decode_zigzag(x):
     return out
 
 
-def split_half_bytes(x):
+def split_half_bytes(x: int):
     return x >> 4, x & 0x0F
-
-MARKER_PREFIX = 0xFF
-STANDALONE_MARKERS = tuple(f"RST{i}" for i in range(8)) + ("SOI", "EOI", "TEM")
 
 
 def decode_marker(codes: bytes):
     assert codes[0] == MARKER_PREFIX
     assert codes[1] not in (0x00, 0xFF)
-    return "RES" if 0x02 <= codes[1] <= 0xBF else byte_to_marker[codes[1]]
+    return "RES" if 0x02 <= codes[1] <= 0xBF else BYTE_TO_MARKER[codes[1]]
 
 
 def handle_app0(payload: bytes):
     # https://www.w3.org/Graphics/JPEG/jfif.pdf
-    assert payload[:5] == b"JFIF\x00"
+    if payload[:5] == b"JFIF\x00":
+        version = f"{payload[5]}.{payload[6]:02d}"
+        print(f"  version: {version}")
 
-    version = f"{payload[5]}.{payload[6]:02d}"
-    print(f"  version: {version}")
+        units = ["no units", "dpi", "dpcm"][payload[7]]
+        print(f"  units: {units}")
 
-    units = ["no units", "dpi", "dpcm"][payload[7]]
-    print(f"  units: {units}")
+        x_density, y_density = struct.unpack(">HH", payload[8:12])
+        print(f"  {x_density = }, {y_density = }")
 
-    x_density, y_density = struct.unpack(">HH", payload[8:12])
-    print(f"  {x_density = }, {y_density = }")
-
-    x_thumbnail, y_thumbnail = payload[12:14]
-    print(f"  {x_thumbnail = }, {y_thumbnail = }")
-    if x_thumbnail > 0 or y_thumbnail > 0:
-        print(f"  thumbnail exists. not handled")
+        x_thumbnail, y_thumbnail = payload[12:14]
+        print(f"  {x_thumbnail = }, {y_thumbnail = }")
+        n = x_thumbnail * y_thumbnail
+        assert len(payload) == 14 + n * 3
+        if n > 0:
+            return np.array(payload[14:]).reshape(y_thumbnail, x_thumbnail, 3)
+    
+    elif payload[:5] == b"JFXX\x00":
+        # JFIF extension
+        print(f"  JFIF extension (JFXX) is not supported")
+    
+    else:
+        print("  unrecognized APP0 marker")
 
 
 def handle_dqt(payload: bytes):
@@ -132,32 +137,36 @@ def handle_sof0(payload: bytes):
 
 
 def handle_dht(payload: bytes):
-    # itu-t81 p.54, Annex C
+    # itu-t81 p.40
     is_ac, h_table_id = split_half_bytes(payload[0])
     print(f"  {is_ac = }")
     print(f"  {h_table_id = }")
 
     # https://www.youtube.com/watch?v=Sls8zdGU4cQ
-    # http://imrannazar.com/Let%27s-Build-a-JPEG-Decoder%3A-Huffman-Tables
-    num_codes = list(payload[1:17])
-    assert sum(num_codes) == len(payload) - 17
-    print(f"  {num_codes = }")
-    print(f"  num_symbols = {sum(num_codes)}")
+    bits = list(payload[1:17])
+    assert sum(bits) == len(payload) - 17
+    print(f"  {bits = }")
+    print(f"  total number of codes = {sum(bits)}")
 
-    code = 0
-    offset = 17
-    for i, num_c in enumerate(num_codes):
-        codes, values = [], []
-        for _ in range(num_c):
-            codes.append(code)
-            values.append(payload[offset])
-            code += 1
-            offset += 1
-        code << 1
-        
-        if codes:
-            values = " ".join([f"{v:x}" for v in values])
-            print(f"  {i+1:2d}-bit codes: {values}")
+    # itu-t81 p.54, Annex C
+    huffsize, huffcode = [], []
+    code, offset = 0, 17
+    for i, num_codes in enumerate(bits):
+        for _ in range(num_codes):
+            huffsize.append(i + 1)
+            huffcode.append(code)
+            code, offset = code + 1, offset + 1
+        code = code << 1
+    
+    curr_size, curr_codes = 1, []
+    for size, code in zip(huffsize, huffcode):
+        if size > curr_size:
+            fmt = f"{{:0{curr_size}b}}"
+            print(f"  {curr_size:2d}-bit ({len(curr_codes)} codes):", *list(map(fmt.format, curr_codes)))
+            curr_size, curr_codes = curr_size + 1, []
+        curr_codes.append(code)
+    fmt = f"{{:0{curr_size}b}}"
+    print(f"  {curr_size:2d}-bit ({len(curr_codes)} codes):", *list(map(fmt.format, curr_codes)))
 
 
 def handle_sos(payload: bytes):
@@ -193,7 +202,6 @@ def read_image_data(f):
 
     return buffer[:-2], decode_marker(buffer[-2:])
 
-huffman_tables = [{} for _ in range(32)]
 
 HANDLER_TABLE = dict(
     APP0=handle_app0,
