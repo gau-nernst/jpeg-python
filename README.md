@@ -2,7 +2,9 @@
 
 Explore JPEG standard with Python!
 
-The first goal is to have a working decoder for baseline JPEG.
+Features:
+
+- Decode JFIF Baseline JPEG
 
 Resources:
 
@@ -13,6 +15,12 @@ Resources:
 ## Decoder
 
 All logic is implemented in pure Python with built-in standard libraries, with an exception of inverse DCT and YCbCr -> RGB conversion. They are implemented using Numpy via matrix multiplication. The returned value is a Numpy array.
+
+```bash
+python decode.py image.jpg
+```
+
+Compare with PIL and OpenCV-Python, the decoded result is a bit different. I'm still trying to figure out the reason.
 
 Process and Lessons I have learned:
 
