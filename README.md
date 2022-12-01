@@ -12,7 +12,7 @@ Resources:
 
 ## Decoder
 
-All logic is implemented in pure Python with built-in standard libraries, with an exception of inverse DCT. Inverse DCT is implemented using Numpy via matrix multiplication.
+All logic is implemented in pure Python with built-in standard libraries, with an exception of inverse DCT and YCbCr -> RGB conversion. They are implemented using Numpy via matrix multiplication. The returned value is a Numpy array.
 
 Process and Lessons I have learned:
 
