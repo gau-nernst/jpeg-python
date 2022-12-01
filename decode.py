@@ -1,5 +1,7 @@
+import itertools
+import math
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -7,24 +9,35 @@ import numpy as np
 
 @dataclass
 class HuffmanTable:
-    huffsize: Optional[np.ndarray] = None
-    huffcode: Optional[np.ndarray] = None
-    huffval: Optional[np.ndarray] = None
-    mincode: Optional[np.ndarray] = None
-    maxcode: Optional[np.ndarray] = None
-    valptr: Optional[np.ndarray] = None
+    huffsize: Optional[tuple] = None
+    huffcode: Optional[tuple] = None
+    huffval: Optional[tuple] = None
+    mincode: Optional[tuple] = None
+    maxcode: Optional[tuple] = None
+    valptr: Optional[tuple] = None
+
+
+QuantizationTable = Tuple
 
 
 @dataclass
-class QuantizationTable:
-    data: Optional[np.ndarray] = None
+class Component:
+    x_sampling: int
+    y_sampling: int
+    q_table_id: int
+    h_table_dc_id: int = 0  # to be updated by SOS
+    h_table_ac_id: int = 0
 
 
 @dataclass
 class JPEGDecoderState:
+    width: Optional[int] = None
+    height: Optional[int] = None
     huffman_tables_dc: Tuple[HuffmanTable] = tuple(HuffmanTable() for _ in range(4))
     huffman_tables_ac: Tuple[HuffmanTable] = tuple(HuffmanTable() for _ in range(4))
-    q_tables: Tuple[QuantizationTable] = tuple(QuantizationTable() for _ in range(4))
+    q_tables: List[Optional[QuantizationTable]] = field(default_factory=lambda: [None] * 4)
+    components: Optional[List[Component]] = None
+    component_ids: Optional[List[int]] = None
 
 
 # https://www.w3.org/Graphics/JPEG/itu-t81.pdf
@@ -33,49 +46,74 @@ class JPEGDecoderState:
 MARKER_PREFIX = 0xFF
 STANDALONE_MARKERS = tuple(f"RST{i}" for i in range(8)) + ("SOI", "EOI", "TEM")
 
-BYTE_TO_MARKER = {
-    0x01: "TEM",  # temporary private use in arithmetic coding
-    0xFE: "COM",  # comment
-}
+MARKER_TO_BYTE = dict(
+    TEM=0x01,  # temporary private use in arithmetic coding
+    COM=0xFE,  # comment
+)
 
 for i in range(16):
-    BYTE_TO_MARKER[0xC0 + i] = f"SOF{i}"  # start of frame
+    MARKER_TO_BYTE[f"SOF{i}"] = 0xC0 + i  # start of frame
 
-BYTE_TO_MARKER.update(
-    {
-        0xC4: "DHT",  # define Huffman table
-        0xC8: "JPG",  # reserved
-        0xCC: "DAC",  # define arithmetic coding conditioning(s)
-    }
+MARKER_TO_BYTE.update(
+    DHT=0xC4,  # define Huffman table
+    JPG=0xC8,  # reserved
+    DAC=0xCC,  # define arithmetic coding conditioning(s)
 )
 
 # restart interval termination
 for i in range(8):
-    BYTE_TO_MARKER[0xD0 + i] = f"RST{i}"
+    MARKER_TO_BYTE[f"RST{i}"] = 0xD0 + i
 
-BYTE_TO_MARKER.update(
-    {
-        0xD8: "SOI",  # start of image
-        0xD9: "EOI",  # end of image
-        0xDA: "SOS",  # start of scan
-        0xDB: "DQT",  # define quantization table
-        0xDC: "DNL",  # define number of lines
-        0xDD: "DRI",  # define restart interval
-        0xDE: "DHP",  # define hierarchical progression
-        0xDF: "EXP",  # expand reference component(s)
-    }
+MARKER_TO_BYTE.update(
+    SOI=0xD8,  # start of image
+    EOI=0xD9,  # end of image
+    SOS=0xDA,  # start of scan
+    DQT=0xDB,  # define quantization table
+    DNL=0xDC,  # define number of lines
+    DRI=0xDD,  # define restart interval
+    DHP=0xDE,  # define hierarchical progression
+    EXP=0xDF,  # expand reference component(s)
 )
 
 for i in range(16):
-    BYTE_TO_MARKER[0xE0 + i] = f"APP{i}"  # app segments
+    MARKER_TO_BYTE[f"APP{i}"] = 0xE0 + i  # app segments
 
 for i in range(14):
-    BYTE_TO_MARKER[0xF0 + i] = f"JPG{i}"  # reserved
+    MARKER_TO_BYTE[f"JPG{i}"] = 0xF0 + i  # reserved
+
+
+BYTE_TO_MARKER = {v: k for k, v in MARKER_TO_BYTE.items()}
+
+
+# a(u,v) * cos((i+1/2)*u*pi/N)
+DCT_MATRIX: np.ndarray = (2 / 8) ** 0.5 * np.cos((np.arange(8) + 0.5)[None, :] * np.arange(8)[:, None] * np.pi / 8)
+DCT_MATRIX[0, :] = (1 / 8) ** 0.5
+
+
+def idct(x: np.ndarray):
+    assert x.ndim == 2
+    return DCT_MATRIX.T @ x @ DCT_MATRIX
+
+
+# JFIF, p.3
+YCbCr_offset = np.array([0.0, -128.0, -128.0]).reshape(1, 1, -1)
+YCbCr_to_RGB = np.array(
+    [
+        [1.0, 0.0, 1.402],
+        [1.0, -0.34414, -0.71414],
+        [1.0, 1.772, 0.0],
+    ]
+)
+
+
+def ycbcr_to_rgb(img: np.ndarray):
+    assert img.ndim == 3 and img.shape[2] == 3, img.shape
+    return (img + YCbCr_offset) @ YCbCr_to_RGB.T
 
 
 def decode_zigzag(x: np.ndarray):
     assert len(x) == 64
-    out = np.empty((8, 8), dtype=x.dtype)
+    out = np.empty((8, 8), dtype=int)
     idx = i = j = 0
     while idx < len(x):
         out[i][j] = x[idx]
@@ -101,6 +139,20 @@ def decode_marker(codes: bytes):
     return "RES" if 0x02 <= codes[1] <= 0xBF else BYTE_TO_MARKER[codes[1]]
 
 
+HANDLER_TABLE = dict()
+
+
+def register_handler(name):
+    assert name not in HANDLER_TABLE
+
+    def _register(handler):
+        HANDLER_TABLE[name] = handler
+        return handler
+
+    return _register
+
+
+@register_handler("APP0")
 def handle_app0(payload: bytes, state: JPEGDecoderState):
     # https://www.w3.org/Graphics/JPEG/jfif.pdf
     if payload[:5] == b"JFIF\x00":
@@ -128,51 +180,62 @@ def handle_app0(payload: bytes, state: JPEGDecoderState):
         print("  unrecognized APP0 marker")
 
 
+@register_handler("DQT")
 def handle_dqt(payload: bytes, state: JPEGDecoderState):
     # itu-t81 B.2.4.1 p.39
     # DQT segment can contain multiple quantization tables
     pointer = 0
     while pointer < len(payload):
         precision, q_table_id = split_half_bytes(payload[pointer])
-        dtype = np.dtype(">uint16") if precision else np.uint8
-        print(f"  {dtype = }")
         print(f"  {q_table_id = }")
 
         table_size = 64 * (precision + 1)
-        table = np.frombuffer(payload[pointer + 1 : pointer + 1 + table_size], dtype=dtype)
-        table = decode_zigzag(table)
-        state.q_tables[q_table_id].data = table
-        print(table)
+        fmt = ">" + ("H" if precision else "B") * table_size
+        table = struct.unpack(fmt, payload[pointer + 1 : pointer + 1 + table_size])
+        state.q_tables[q_table_id] = table
+        print(decode_zigzag(table))
         pointer += 1 + table_size
 
 
+@register_handler("DRI")
 def handle_dri(payload: bytes, state: JPEGDecoderState):
-    restart_interval = struct.unpack(">H", payload)
+    (restart_interval,) = struct.unpack(">H", payload)
     print(f"  {restart_interval = }")
 
 
+@register_handler("COM")
 def handle_com(payload: bytes, state: JPEGDecoderState):
     print(f"  {payload = }")
 
 
+@register_handler("SOF0")
 def handle_sof0(payload: bytes, state: JPEGDecoderState):
-    bits = payload[0]
-    print(f"  {bits} bits per pixel per component")
+    # itu-t81 B.2.2 p.35
+    precision = payload[0]
+    print(f"  {precision = }")
 
     height, width = struct.unpack(">HH", payload[1:5])
     print(f"  {width = }, {height = }")
+    state.width = width
+    state.height = height
 
-    num_components = payload[5]
-    print(f"  {num_components = }")
+    n_components = payload[5]
+    print(f"  {n_components = }")
 
+    components = [None] * n_components
     offset = 6
-    for _ in range(num_components):
+    for _ in range(n_components):
         component_id, sampling_rate, q_table_id = payload[offset : offset + 3]
-        sampling_rate = split_half_bytes(sampling_rate)
-        print(f"    {component_id = }: {sampling_rate = } {q_table_id = }")
+        assert component_id <= n_components
+        x_sampling, y_sampling = split_half_bytes(sampling_rate)
+        print(f"    {component_id = }: {x_sampling = } {y_sampling = } {q_table_id = }")
+
+        components[component_id - 1] = Component(x_sampling, y_sampling, q_table_id)
         offset += 3
+    state.components = components
 
 
+@register_handler("DHT")
 def handle_dht(payload: bytes, state: JPEGDecoderState):
     # itu-t81 B.2.4.2 p.40
     # DHT segment can contain multiple Huffman tables
@@ -212,86 +275,147 @@ def handle_dht(payload: bytes, state: JPEGDecoderState):
         _table.maxcode = tuple(maxcode)
         _table.valptr = tuple(valptr)
 
-        curr_size, curr_codes = 1, []
-        for size, code in zip(huffsize, huffcode):
-            if size > curr_size:
-                fmt = f"{{:0{curr_size}b}}"
-                print(f"  {curr_size:2d}-bit ({len(curr_codes)} codes):", *list(map(fmt.format, curr_codes)))
-                curr_size, curr_codes = curr_size + 1, []
-            curr_codes.append(code)
-        fmt = f"{{:0{curr_size}b}}"
-        print(f"  {curr_size:2d}-bit ({len(curr_codes)} codes):", *list(map(fmt.format, curr_codes)))
-
         pointer += 17 + n_values
 
 
+@register_handler("SOS")
 def handle_sos(payload: bytes, state: JPEGDecoderState):
-    # itu-t81 B.2.3 p.41
-    num_components = payload[0]
-    print(f"  {num_components = }")
+    # itu-t81 B.2.3 p.37
+    n_components = payload[0]
+    print(f"  {n_components = }")
 
     offset = 1
-    for _ in range(num_components):
+    state.component_ids = []
+    for _ in range(n_components):
         component_id, h_table = payload[offset : offset + 2]
-        h_table = split_half_bytes(h_table)
-        print(f"  {component_id = } {h_table = }")
+        h_table_dc_id, h_table_ac_id = split_half_bytes(h_table)
+        print(f"  {component_id = } {h_table_dc_id = } {h_table_ac_id = }")
+
+        state.component_ids.append(component_id - 1)
+        state.components[component_id - 1].h_table_dc_id = h_table_dc_id
+        state.components[component_id - 1].h_table_ac_id = h_table_ac_id
         offset += 2
 
+    # not used for now
     start_of_select, end_of_select, sar = payload[offset:]
     print(f"  {start_of_select = }")
     print(f"  {end_of_select = }")
     print(f"  {sar = }")
 
 
-def read_scan(f, state: JPEGDecoderState):
-    # read until seeing 0xFFxx, while skipping 0xFF00 and 0xFFD0-0xFFD7
-    buffer = []
-
-    h_table = state.huffman_tables_dc[0]
-    size, code = 0, 0
-    values = []
+def next_bit(f):
+    # p.111
     while True:
         byte = f.read(1)[0]
-        print(f"{byte:08b}")
+        if byte == MARKER_PREFIX:
+            byte2 = f.read(1)[0]
+            if byte2 != 0:  # byte stuffing
+                assert byte2 == MARKER_TO_BYTE["DNL"], hex(byte2)
+                raise RuntimeError("DNL marker is not handled")
+
         for i in range(7, -1, -1):
-            size += 1
-            code = (code << 1) + ((byte >> i) & 1)
-            if code > h_table.maxcode[size - 1]:
-                continue
-
-            print("  size:", size)
-            print("  code:", "{:b}".format(code))
-            j = h_table.valptr[size - 1] + code - h_table.mincode[size - 1]
-            values.append(h_table.huffval[j])
-
-            if len(values) > 100:
-                print(values)
-                raise
-
-            size, code = 0, 0
-
-        # buffer.append(f.read(1)[0])
-        # if buffer[-1] == MARKER_PREFIX:
-        #     continue
-
-        # buffer.append(f.read(1)[0])
-        # if buffer[-1] == 0x00 or 0xD0 <= buffer[-1] <= 0xD7:
-        #     continue
-
-        # break
-
-    return buffer[:-2], decode_marker(buffer[-2:])
+            yield (byte >> i) & 1
 
 
-HANDLER_TABLE = dict(
-    APP0=handle_app0,
-    DQT=handle_dqt,
-    DHT=handle_dht,
-    DRI=handle_dri,
-    SOF0=handle_sof0,
-    SOS=handle_sos,
-    COM=handle_com,
-)
+def decode(bit_generator, h_table: HuffmanTable):
+    # itu-t81, Figure F.16, DECODE
+    size, code = 1, next(bit_generator)
+    while code > h_table.maxcode[size - 1]:
+        size += 1
+        code = (code << 1) + next(bit_generator)
+    j = h_table.valptr[size - 1] + code - h_table.mincode[size - 1]
+    return h_table.huffval[j]
+
+
+def receive(bit_generator, n_bits):
+    # F.2.2.4, p.110, Figure F.17
+    value = 0
+    for _ in range(n_bits):
+        value = (value << 1) + next(bit_generator)
+    return value
+
+
+def extend(value, n_bits):
+    # p.105, Figure F.12
+    return value + (-1 << n_bits) + 1 if value < (1 << (n_bits - 1)) else value
+
+
+def read_scan(f, state: JPEGDecoderState):
+    n_components = len(state.components)
+    max_x_sampling = max(state.components[idx].x_sampling for idx in state.component_ids)
+    max_y_sampling = max(state.components[idx].y_sampling for idx in state.component_ids)
+
+    x_blocks = math.ceil(state.width / 8)
+    y_blocks = math.ceil(state.height / 8)
+
+    x_scales = [max_x_sampling // state.components[idx].x_sampling for idx in range(n_components)]
+    y_scales = [max_y_sampling // state.components[idx].y_sampling for idx in range(n_components)]
+
+    image = np.empty((state.height, state.width, n_components), dtype=np.uint8)
+
+    dc_coefs = [0] * n_components
+    bit_generator = next_bit(f)
+    for (mcu_y, mcu_x) in itertools.product(range(y_blocks // max_y_sampling), range(x_blocks // max_x_sampling)):
+        mcu = np.empty((8 * max_y_sampling, 8 * max_x_sampling, n_components), dtype=np.uint8)
+        for component_id in state.component_ids:
+            component = state.components[component_id]
+            h_dc_table = state.huffman_tables_dc[component.h_table_dc_id]
+            h_ac_table = state.huffman_tables_ac[component.h_table_dc_id]
+            q_table = state.q_tables[component.q_table_id]
+
+            for (yi, xi) in itertools.product(range(component.y_sampling), range(component.x_sampling)):
+                dct_coefs = [0] * 64
+
+                # decode dc coefficient: itu-t81, p.104, F.2.2.1
+                n_bits = decode(bit_generator, h_dc_table)
+                if n_bits == 0:
+                    diff = 0
+                else:
+                    diff = receive(bit_generator, n_bits)
+                    diff = extend(diff, n_bits)
+                dc_coefs[component_id] += diff
+                dct_coefs[0] = dc_coefs[component_id]
+
+                # decode ac coefficients: F.2.2.2, p.105, Figure F.13
+                # to understand, also read F.1.2.2 encode ac coefficients
+                dct_idx = 1
+                while dct_idx < 64:
+                    composite = decode(bit_generator, h_ac_table)
+                    n_skip, n_bits = split_half_bytes(composite)
+                    if n_bits == 0:
+                        if n_skip == 15:  # ZRL - zero run-length
+                            dct_idx += 16
+                        elif n_skip == 0:  # EOB - end of block
+                            break
+                        else:
+                            raise ValueError
+                    else:
+                        dct_idx += n_skip
+                        value = receive(bit_generator, n_bits)
+                        value = extend(value, n_bits)
+                        dct_coefs.append(value)
+                        dct_coefs[dct_idx] = value
+                        dct_idx += 1
+
+                dequantized = [v * q for v, q in zip(dct_coefs, q_table)]
+                dct_block = decode_zigzag(dequantized)
+                block = idct(dct_block)
+                block += 128  # level shift
+
+                block = np.repeat(block, x_scales[component_id], axis=1)
+                block = np.repeat(block, y_scales[component_id], axis=0)
+                x_block_size = 8 * x_scales[component_id]
+                y_block_size = 8 * y_scales[component_id]
+                mcu[
+                    yi * y_block_size : (yi + 1) * y_block_size,
+                    xi * x_block_size : (xi + 1) * x_block_size,
+                    component_id,
+                ] = block
+
+        mcu = ycbcr_to_rgb(mcu)
+        image[mcu_y * 16 : (mcu_y + 1) * 16, mcu_x * 16 : (mcu_x + 1) * 16, :] = mcu.round()
+
+    return image
 
 
 def decode_jpeg(f):
@@ -311,20 +435,31 @@ def decode_jpeg(f):
         print(f"  {length = }")
         payload = f.read(length - 2)
 
-        # https://www.ccoderun.ca/programming/2017-01-31_jpeg/
-        # https://www.youtube.com/watch?v=TlrNCT15NM4
-
         HANDLER_TABLE[marker](payload, state)
         print()
 
         if marker == "SOS":
-            image_data, marker = read_scan(f, state)
-            continue
+            image = read_scan(f, state)
 
         marker = decode_marker(f.read(2))
 
+    return image
+
+
+def main():
+    import argparse
+
+    from PIL import Image
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("path")
+    args = parser.parse_args()
+
+    image = decode_jpeg(open(args.path, "rb"))
+    pil_image = np.array(Image.open(args.path))
+
+    print(((image - pil_image) ** 2).mean() ** 0.5)
+
 
 if __name__ == "__main__":
-    path = "../../ZooA_1581.jpg"
-    f = open(path, "rb")
-    decode_jpeg(f)
+    main()
