@@ -33,14 +33,12 @@ class Component:
 class JPEGDecoderState:
     width: Optional[int] = None
     height: Optional[int] = None
-    huffman_tables_dc: Tuple[HuffmanTable] = tuple(HuffmanTable() for _ in range(4))
-    huffman_tables_ac: Tuple[HuffmanTable] = tuple(HuffmanTable() for _ in range(4))
-    q_tables: List[Optional[QuantizationTable]] = field(default_factory=lambda: [None] * 4)
     components: Optional[List[Component]] = None
     component_ids: Optional[List[int]] = None
+    q_tables: List[Optional[QuantizationTable]] = field(default_factory=lambda: [None] * 4)
+    huffman_tables_dc: List[Optional[HuffmanTable]] = field(default_factory=lambda: [None] * 4)
+    huffman_tables_ac: List[Optional[HuffmanTable]] = field(default_factory=lambda: [None] * 4)
 
-
-# https://www.w3.org/Graphics/JPEG/itu-t81.pdf
 
 # itu-t81 p.36
 MARKER_PREFIX = 0xFF
@@ -191,9 +189,9 @@ def handle_dqt(payload: bytes, state: JPEGDecoderState):
 
         table_size = 64 * (precision + 1)
         fmt = ">" + ("H" if precision else "B") * table_size
-        table = struct.unpack(fmt, payload[pointer + 1 : pointer + 1 + table_size])
-        state.q_tables[q_table_id] = table
-        print(decode_zigzag(table))
+        q_table = struct.unpack(fmt, payload[pointer + 1 : pointer + 1 + table_size])
+        state.q_tables[q_table_id] = q_table
+        print(decode_zigzag(q_table))
         pointer += 1 + table_size
 
 
@@ -222,7 +220,7 @@ def handle_sof0(payload: bytes, state: JPEGDecoderState):
     n_components = payload[5]
     print(f"  {n_components = }")
 
-    components = [None] * n_components
+    state.components = [None] * n_components
     offset = 6
     for _ in range(n_components):
         component_id, sampling_rate, q_table_id = payload[offset : offset + 3]
@@ -230,9 +228,8 @@ def handle_sof0(payload: bytes, state: JPEGDecoderState):
         x_sampling, y_sampling = split_half_bytes(sampling_rate)
         print(f"    {component_id = }: {x_sampling = } {y_sampling = } {q_table_id = }")
 
-        components[component_id - 1] = Component(x_sampling, y_sampling, q_table_id)
+        state.components[component_id - 1] = Component(x_sampling, y_sampling, q_table_id)
         offset += 3
-    state.components = components
 
 
 @register_handler("DHT")
@@ -242,7 +239,6 @@ def handle_dht(payload: bytes, state: JPEGDecoderState):
     pointer = 0
     while pointer < len(payload):
         is_ac, h_table_id = split_half_bytes(payload[pointer])
-        _table = (state.huffman_tables_ac if is_ac else state.huffman_tables_dc)[h_table_id]
         print(f"  {is_ac = }")
         print(f"  {h_table_id = }")
 
@@ -252,7 +248,6 @@ def handle_dht(payload: bytes, state: JPEGDecoderState):
         print(f"  total number of codes = {sum(bits)}")
 
         huffval = tuple(payload[pointer + 17 : pointer + 17 + n_values])
-        _table.huffval = huffval
         print(f"  {huffval = }")
 
         # itu-t81 p.50, Annex C
@@ -269,11 +264,9 @@ def handle_dht(payload: bytes, state: JPEGDecoderState):
                 code, offset = code + 1, offset + 1
             maxcode.append(code - 1 if num_codes > 0 else -1)
             code = code << 1
-        _table.huffsize = tuple(huffsize)
-        _table.huffcode = tuple(huffcode)
-        _table.mincode = tuple(mincode)
-        _table.maxcode = tuple(maxcode)
-        _table.valptr = tuple(valptr)
+        
+        h_table = HuffmanTable(huffsize, huffcode, huffval, mincode, maxcode, valptr)
+        (state.huffman_tables_ac if is_ac else state.huffman_tables_dc)[h_table_id] = h_table
 
         pointer += 17 + n_values
 
@@ -327,7 +320,7 @@ def decode(bit_generator, h_table: HuffmanTable):
     return h_table.huffval[j]
 
 
-def receive(bit_generator, n_bits):
+def receive(bit_generator, n_bits: int):
     # F.2.2.4, p.110, Figure F.17
     value = 0
     for _ in range(n_bits):
@@ -335,9 +328,9 @@ def receive(bit_generator, n_bits):
     return value
 
 
-def extend(value, n_bits):
+def extend(value: int, n_bits: int):
     # p.105, Figure F.12
-    return value + (-1 << n_bits) + 1 if value < (1 << (n_bits - 1)) else value
+    return value + (-1 << n_bits) + 1 if n_bits > 0 and value < (1 << (n_bits - 1)) else value
 
 
 def read_scan(f, state: JPEGDecoderState):
@@ -368,11 +361,8 @@ def read_scan(f, state: JPEGDecoderState):
 
                 # decode dc coefficient: itu-t81, p.104, F.2.2.1
                 n_bits = decode(bit_generator, h_dc_table)
-                if n_bits == 0:
-                    diff = 0
-                else:
-                    diff = receive(bit_generator, n_bits)
-                    diff = extend(diff, n_bits)
+                diff = receive(bit_generator, n_bits)
+                diff = extend(diff, n_bits)
                 dc_coefs[component_id] += diff
                 dct_coefs[0] = dc_coefs[component_id]
 
@@ -381,19 +371,15 @@ def read_scan(f, state: JPEGDecoderState):
                 dct_idx = 1
                 while dct_idx < 64:
                     composite = decode(bit_generator, h_ac_table)
-                    n_skip, n_bits = split_half_bytes(composite)
-                    if n_bits == 0:
-                        if n_skip == 15:  # ZRL - zero run-length
-                            dct_idx += 16
-                        elif n_skip == 0:  # EOB - end of block
-                            break
-                        else:
-                            raise ValueError
+                    if composite == 0xF0:   # ZRL - zero run-length
+                        dct_idx += 16
+                    elif composite == 0:    # EOB - end of block
+                        break
                     else:
+                        n_skip, n_bits = split_half_bytes(composite)
                         dct_idx += n_skip
                         value = receive(bit_generator, n_bits)
                         value = extend(value, n_bits)
-                        dct_coefs.append(value)
                         dct_coefs[dct_idx] = value
                         dct_idx += 1
 

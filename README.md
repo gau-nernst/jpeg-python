@@ -10,6 +10,10 @@ Resources:
 - [JPEG Part 1 - ITU T.81](https://www.w3.org/Graphics/JPEG/itu-t81.pdf)
 - [JPEG Part 5 - JFIF](https://www.w3.org/Graphics/JPEG/jfif.pdf)
 
+## Decoder
+
+All logic is implemented in pure Python with built-in standard libraries, with an exception of inverse DCT. Inverse DCT is implemented using Numpy via matrix multiplication.
+
 Process and Lessons I have learned:
 
 - Implement a marker parser first. Look at ITU T.81 p.36 for the list of all markers. Look for `0xFF`, and the next byte determines the marker type. ITU T.81 Annex B will define the bitstream for each marker. Use JFIF (JPEG Part 5) to parse marker `APP0`, even though it is not important.
@@ -41,4 +45,7 @@ Process and Lessons I have learned:
     - For Y component (4 blocks), place each block at each corner.
     - For Cb and Cr components (1 block each), scale each block up (from 8x8 to 16x16).
   - Convert YCbCr to RGB. Refer to JFIF p.3
-- For each DCT coefficient, only the **size** (number of bits) is Huffman-encoded, the value is not.
+- For each DCT coefficient, only the **size** (number of bits) is Huffman-encoded (which is referred to as **magnitude/amplitude categories** in ITU T.81), the value is not. The value is encoded in a pretty strange way:
+  - The first bit indicates sign (1 for positive, 0 for negative), and the remaining bits indicate the magnitude from 2^(size-1) for positive, and from -2^size+1 for negative. Refer to ITU T.81 F.1.2.1.1 and F.1.2.2.1 (Structure of DC/AC code table)
+  - If the first bit is 1, the value is positive and can be interpreted normally. This means that the value must be from 2^(size-1) to 2^size - 1).
+  - If the first bit is 0, the value is negative, and the remaining bits is the positive value from -2^size+1. In other words, the decoded value is -2^size + 1 + value. (Refer to procedure EXTEND, ITU T.81 Figure F.12 p.105)
