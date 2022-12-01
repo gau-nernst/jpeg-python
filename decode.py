@@ -109,9 +109,9 @@ def ycbcr_to_rgb(img: np.ndarray):
     return (img + YCbCr_offset) @ YCbCr_to_RGB.T
 
 
-def decode_zigzag(x: np.ndarray):
+def decode_zigzag(x: List[int]):
     assert len(x) == 64
-    out = np.empty((8, 8), dtype=int)
+    out = np.empty((8, 8))
     idx = i = j = 0
     while idx < len(x):
         out[i][j] = x[idx]
@@ -264,7 +264,7 @@ def handle_dht(payload: bytes, state: JPEGDecoderState):
                 code, offset = code + 1, offset + 1
             maxcode.append(code - 1 if num_codes > 0 else -1)
             code = code << 1
-        
+
         h_table = HuffmanTable(huffsize, huffcode, huffval, mincode, maxcode, valptr)
         (state.huffman_tables_ac if is_ac else state.huffman_tables_dc)[h_table_id] = h_table
 
@@ -322,10 +322,7 @@ def decode(bit_generator, h_table: HuffmanTable):
 
 def receive(bit_generator, n_bits: int):
     # F.2.2.4, p.110, Figure F.17
-    value = 0
-    for _ in range(n_bits):
-        value = (value << 1) + next(bit_generator)
-    return value
+    return sum(next(bit_generator) << i for i in range(n_bits - 1, -1, -1))
 
 
 def extend(value: int, n_bits: int):
@@ -371,9 +368,9 @@ def read_scan(f, state: JPEGDecoderState):
                 dct_idx = 1
                 while dct_idx < 64:
                     composite = decode(bit_generator, h_ac_table)
-                    if composite == 0xF0:   # ZRL - zero run-length
+                    if composite == 0xF0:  # ZRL - zero run-length
                         dct_idx += 16
-                    elif composite == 0:    # EOB - end of block
+                    elif composite == 0:  # EOB - end of block
                         break
                     else:
                         n_skip, n_bits = split_half_bytes(composite)
@@ -387,6 +384,7 @@ def read_scan(f, state: JPEGDecoderState):
                 dct_block = decode_zigzag(dequantized)
                 block = idct(dct_block)
                 block += 128  # level shift
+                block = block.round().clip(min=0, max=255)
 
                 block = np.repeat(block, x_scales[component_id], axis=1)
                 block = np.repeat(block, y_scales[component_id], axis=0)
@@ -399,7 +397,8 @@ def read_scan(f, state: JPEGDecoderState):
                 ] = block
 
         mcu = ycbcr_to_rgb(mcu)
-        image[mcu_y * 16 : (mcu_y + 1) * 16, mcu_x * 16 : (mcu_x + 1) * 16, :] = mcu.round()
+        mcu = mcu.round().clip(min=0, max=255)
+        image[mcu_y * 16 : (mcu_y + 1) * 16, mcu_x * 16 : (mcu_x + 1) * 16, :] = mcu
 
     return image
 
@@ -435,6 +434,7 @@ def decode_jpeg(f):
 def main():
     import argparse
 
+    import cv2
     from PIL import Image
 
     parser = argparse.ArgumentParser()
@@ -442,9 +442,16 @@ def main():
     args = parser.parse_args()
 
     image = decode_jpeg(open(args.path, "rb"))
-    pil_image = np.array(Image.open(args.path))
 
-    print(((image - pil_image) ** 2).mean() ** 0.5)
+    pil_image = np.array(Image.open(args.path))
+    diff = image - pil_image
+    print((diff**2).mean() ** 0.5)
+    print(np.abs(diff).max())
+
+    cv2_image = cv2.imread(args.path)[:, :, ::-1]
+    diff = image - cv2_image
+    print((diff**2).mean() ** 0.5)
+    print(np.abs(diff).max())
 
 
 if __name__ == "__main__":
