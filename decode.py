@@ -36,8 +36,8 @@ class JPEGDecoderState:
     components: Optional[List[Component]] = None
     component_ids: Optional[List[int]] = None
     q_tables: List[Optional[QuantizationTable]] = field(default_factory=lambda: [None] * 4)
-    huffman_tables_dc: List[Optional[HuffmanTable]] = field(default_factory=lambda: [None] * 4)
-    huffman_tables_ac: List[Optional[HuffmanTable]] = field(default_factory=lambda: [None] * 4)
+    h_tables_dc: List[Optional[HuffmanTable]] = field(default_factory=lambda: [None] * 4)
+    h_tables_ac: List[Optional[HuffmanTable]] = field(default_factory=lambda: [None] * 4)
 
 
 # itu-t81 p.36
@@ -266,7 +266,7 @@ def handle_dht(payload: bytes, state: JPEGDecoderState):
             code = code << 1
 
         h_table = HuffmanTable(huffsize, huffcode, huffval, mincode, maxcode, valptr)
-        (state.huffman_tables_ac if is_ac else state.huffman_tables_dc)[h_table_id] = h_table
+        (state.h_tables_ac if is_ac else state.h_tables_dc)[h_table_id] = h_table
 
         pointer += 17 + n_values
 
@@ -349,8 +349,8 @@ def read_scan(f, state: JPEGDecoderState):
         mcu = np.empty((8 * max_y_sampling, 8 * max_x_sampling, n_components), dtype=np.uint8)
         for component_id in state.component_ids:
             component = state.components[component_id]
-            h_dc_table = state.huffman_tables_dc[component.h_table_dc_id]
-            h_ac_table = state.huffman_tables_ac[component.h_table_dc_id]
+            h_dc_table = state.h_tables_dc[component.h_table_dc_id]
+            h_ac_table = state.h_tables_ac[component.h_table_dc_id]
             q_table = state.q_tables[component.q_table_id]
 
             for (yi, xi) in itertools.product(range(component.y_sampling), range(component.x_sampling)):
